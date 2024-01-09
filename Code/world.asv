@@ -1,0 +1,503 @@
+buildWorld();
+function buildWorld()
+
+    % Build initial simulation and test car
+    global vehicleLength vehicleWidth actorID dt;
+    scenario = buildEnv(3);
+    allActorPoses = actorPoses(scenario);
+    v1 = vehicle(scenario,'ClassID',1','Position',[-15 -5 0],'Velocity',[0 0 0],'Yaw',0,'Name',"Test Car");
+    actorID = v1.ActorID;
+    vehicleLength = v1.Length;
+    vehicleWidth = v1.Width;
+    xd = [25,-5,0];
+    plot(scenario)
+
+   % Define simulation actions and dynamics
+    va = 1; % Possible actions for deciding velocity (Pick between 0 to 50 m/s)
+    sa = linspace(-pi/4,pi/4,3); % All possible steering angles
+    [vac sac] = meshgrid(va,sa); 
+    dt = 0.1;
+    Qm.a = [vac(:),sac(:)]; % Set of all possible actions
+    gamma = 0.7;   %discout factor
+    layers = [ ...
+        featureInputLayer(3, "Name", "myFeatureInputLayer")
+        fullyConnectedLayer(60, "Name", "myFullyConnectedLayer1")
+        reluLayer("Name", "myReLu1")
+        fullyConnectedLayer(60, "Name", "myFullyConnectedLayer2")
+        reluLayer("Name", "myReLu2")
+        fullyConnectedLayer(length(Qm.a), "Name", "myFullyConnectedLayer3")
+        regressionLayer("Name", "myRegressionLayer")];
+    opts = trainingOptions('adam', ...
+        'MaxEpochs',100, ...
+        'InitialLearnRate',0.01,...
+        'MiniBatchSize',1024, ...
+        'Verbose',false, ...
+    Plots="none");
+    Qm.layers = layers; % main network for training (main network)
+    Qm.opts = opts;
+    Qt =Qm; %network for evaluation (target network)
+    
+    % create a mesh for visualizing the cost-to-go    
+    yaw_bins = linspace(-180,180,25);   
+    x_bins = linspace(-30,30,25);
+    y_bins = linspace(25,-25,25);
+    [yaw, y] = ndgrid(yaw_bins, y_bins);
+    [q qdot] = ndgrid(x_bins,y_bins);
+%     [q qdot yaw] = ndgrid(x_bins,y_bins,yaw_bins);
+    s = [reshape(q,1,numel(q)); reshape(qdot,1,numel(qdot));reshape(yaw,1,numel(yaw))];  
+
+    N = 1; %train the network every "N" simulation steps
+    Ninit = 1000; %number of simulation steps before training starts
+    Nepisode = 200; % maximum number of steps in an episode;
+    %initialize the networks
+    x0k = zeros(3,N);
+    a0k = zeros(2,N);
+    r0k = zeros(1,N);
+    Qmk = zeros(N,length(Qm.a));
+    Qm= learn_q_factor(x0k,Qmk,Qm);
+    Qt= learn_q_factor(x0k,Qmk,Qm);
+    fh = figure(10);
+    Jlast = zeros(length(s),1); %cost function from last iteration
+    dJnorm = [];
+    kJ = [];
+    alpha = 0.9; %learning rate
+    M = 25;%number of episodes
+    P = 100; %number of steps before copying weights to target network
+    k = 1;
+    obstacles = getObstacles(scenario);
+    for i = 1:M
+
+        x0=v1.Position';
+        done = false;
+        epsilon = 0.01 + (1 - 0.01) * exp(-0.01 * i); %update epsilon with every episode
+        j = 1;
+        % while the episode is not complete
+        while done==false 
+            display('epsiode || steps in episode || simulation steps')
+            [i j k]
+
+            x0k(:,k) = x0; %add the state to the history of data
+            a_ind = get_action(Qt,x0,epsilon); %get the action index using epsion-greedy approach
+            a0k(:,k) = a_ind; %save the action index
+            xdot = dynamics(x0,Qt.a(a_ind,:));
+            dps = rps2dps(xdot(3));
+            x1 = x0+[xdot(1);xdot(2);dps]*dt;
+            x1(3) = wrapTo180(x1(3));
+%             x1=x0+dynamics(x0,Qt.a(a_ind,:))*dt;  %simulate the dynamics forward
+            [r, isOffRoad]=getReward(x0,scenario,xd);
+            r0k(:,k) = r;
+            [~,distObstacle]=findClosestObstacle([x0(1),x0(2) 0],obstacles);
+            goalDist = norm(x0(1:2)-xd(1:2));
+            if (goalDist<1)
+                disp("Close to Goal")
+                done = true;
+            end 
+            if (distObstacle < 1)
+                disp("Collision Detected")
+                done = true;
+            end
+            if (isOffRoad == true && k> Ninit)
+                disp("Car OffRoad Detected")
+                done = true;
+            end
+            if(x1(3)>max(yaw_bins)) || (x1(3)<min(yaw_bins)) % Stop if state goes beyond map
+                disp("Turning Bounds Exceeded")
+                done = true;
+            elseif(x1(1)>max(x_bins)) || (x1(1)<min(x_bins)) % Stop if state goes beyond map
+                disp("Map Bounds Exceeded")
+                done = true;
+            elseif(x1(2)>max(y_bins)) || (x1(2)<min(y_bins)) % Stop if state goes beyond map
+                disp("Map Bounds Exceeded")
+                done = true;
+            elseif(j>Nepisode) %if we exceed the episode time horizon, the game is over
+                done = true;
+            else
+            end
+            j=j+1;
+
+            % save the next state
+            x1k(:,k)= x1;
+            % set 
+            x0 = x1;
+            
+            %train the main network every N simulation steps
+            if k>Ninit
+                Qm = train(x0k,a0k,x1k,Qt,gamma,alpha,xd,Qm,r0k);
+            end
+            k = k+1; %increment the simulation step
+            if mod(k,P)==0 && k>Ninit
+                Qt.trainedNet= SeriesNetwork(Qm.layers); %copy the weights from the main network to the target network
+                J = cost_to_go(Qt,s);% get the cost-to-go at the grid points
+                dJnorm = [dJnorm norm(J-Jlast)]; %compare the current cost-to-go with the prior cost-to-go
+                kJ =[kJ k]; % save the simulation step
+                Jlast = J;
+                vi_plot(J,x1k,y_bins,x_bins,fh);
+                figure(11)
+                plot(kJ,dJnorm); %plot the change in the cost-to-go
+            end
+        
+        end
+    
+    end
+
+%     disp("Training Complete")
+%     save('Qt.mat',"Qt.trainedNet")
+%     disp("Network Saved")
+   % Learn Way-Points, Velocities, and Steering angle using Q Learning
+%     Qt.trainedNet = load(Qt.mat);
+
+   % Plot and execute simulation with returned values
+    J = cost_to_go(Qt,s);% get the cost-to-go
+    vi_plot(J,[],y_bins,x_bins,fh);  
+%     v1.Position=[0 0 0];%intial conditions
+%     v1.Yaw = 0;
+%     epsilon = 0;
+%     plot(scenario);
+%     x0 = getKinematicState(v1)';
+    disp("Beginning Simulation")
+    for i=1:1
+        %simulate the policy from the initial conditions
+        v1.Position=[-15 -5 0];%intial conditions
+        v1.Yaw = 0;
+        epsilon = 0;
+%         plot(scenario);
+        x0 = getKinematicState(v1)';
+        done = false;
+        k = 1;
+        while(done == false && k<=600)
+    %         updatePlots(scenario);
+           [~,distObstacle]=findClosestObstacle([x0(1),x0(2) 0],obstacles);
+            if distObstacle < 0.5
+                disp("Collision Detected")
+            end
+            xsave(:,k) = x0;
+            a_ind= get_action(Qt,x0,epsilon); %get the action
+            a0k(:,k) = a_ind;
+            asave(:,k) = Qt.a(a_ind,:)';
+            xdot = dynamics(x0,Qt.a(a_ind,:));
+            v1 = updateActor(v1,xdot,dt);
+            x0 = getKinematicState(v1)';
+            k = k +1;
+            goalDist = norm(x0(1:2)-xd(1:2));
+            if (goalDist < 1)
+                disp("Goal Found")
+                done = true;
+            elseif goalDist > 500
+                disp('Too Far From Goal')
+                done = true;
+            elseif(x0(1)>max(x_bins)) || (x0(1)<min(x_bins)) % Stop if state goes beyond map
+                disp("Map Bounds Exceeded")
+                done = true;
+            elseif(x0(2)>max(y_bins)) || (x0(2)<min(y_bins)) % Stop if state goes beyond map
+                disp("Map Bounds Exceeded")
+                done = true;
+            end
+    %         pause(dt);
+    
+        end
+        waypoints(:,:,i) = [xsave(1,:)' xsave(2,:)'];
+        v1.Position=[-15 -5 0];%intial conditions
+        v1.Yaw = 0;
+        smoothTrajectory(v1,waypoints(:,:,i),asave(1,:))
+        plot(scenario,'Waypoints','on')
+    end
+%     figure(3)
+%     v1.Position=[0 0 0];%intial conditions
+%     v1.Yaw = 0;
+%     smoothTrajectory(v1,waypoints,asave(1,:))
+%     plot(scenario,'Waypoints','on')
+%     figure(2)
+%     hold on
+%     plot(xsave(2,:),xsave(1,:),'*-g') %plot the trajectory for the optimal policy
+%     hold off
+end
+
+% ===============================================================
+% This function builds the initial map
+%================================================================
+function scenario = buildEnv(num)
+    scenario = drivingScenario;
+    switch num
+        case 1
+            v2 = vehicle(scenario,'ClassID',1,'Position',[10 5 0],'Velocity',[0 0 0],'Yaw',180);
+        %     ped = actor(scenario,'ClassID',4,'Length',0.2,'Width',0.4,'Height',1.7);
+            roadCenters = [-20 0; 0 0; 50 0; 100 50; 150 0; 140 -20];
+            rbdry = roadBoundaries(v2);
+            lm = [laneMarking('Solid')
+                  laneMarking('Dashed','Length',2,'Space',4)
+                  laneMarking('Solid')];
+            l = lanespec(2,'Marking',lm,'width',10);
+            sr1 = road(scenario,roadCenters,'Lanes',l);
+            barrier(scenario,sr1)
+            barrier(scenario,sr1,'RoadEdge','left')
+            barrier(scenario,sr1,'RoadEdge','right')
+%             plot(scenario,'Centerline','on','RoadCenters','on');
+%             title('Scenario');
+            % Goal [145 -20 60]; Initial [0 0 0]
+        case 2
+            v2 = vehicle(scenario,'ClassID',1,'Position',[-5 5 0],'Velocity',[0 0 0],'Yaw',180);
+            v3 = vehicle(scenario,'ClassID',1,'Position',[4 -7 0],'Velocity',[0 0 0],'Yaw',90);
+            sr1 = road(scenario,[0 -25; 0 25],'lanes',lanespec([2 2]));
+            sr2 = road(scenario,[-25 0; 25 0],'lanes',lanespec([2 2]));
+            barrier(scenario,sr1)
+            barrier(scenario,sr2)
+            barrier(scenario,sr1,'RoadEdge','left')
+            barrier(scenario,sr1,'RoadEdge','right')
+            barrier(scenario,sr2,'RoadEdge','left')
+            barrier(scenario,sr2,'RoadEdge','right')
+            plot(scenario,'Centerline','on','RoadCenters','on');
+            title('Scenario');
+            % Goal State [5,15,90] Initial Position [-15 -5 0]
+          case 3
+           scenario = drivingScenario;
+           roadCenters = [-30 0;0 0; 30 0];
+           rr = road(scenario,roadCenters,'lanes',lanespec([2 2]));
+           barrierCenters = [20 3; 20 0; 20 -3];
+           barrier(scenario,barrierCenters,'SegmentGap',0.2)
+           barrierCenters1 = [12 3; 12 0];
+           barrierCenters2 = [6 -7; 6 -5];
+           barrier(scenario,barrierCenters1,'SegmentGap',0.2)
+           barrier(scenario,barrierCenters2,'SegmentGap',0.2)
+           barrier(scenario,rr,'RoadEdge','left')
+           barrier(scenario,rr,'RoadEdge','right')
+           % Goal State [25,-5,0] Initial Position [-15 -5 0]
+    end
+end
+
+function state = getKinematicState(actor)
+    state = [actor.Position(1) actor.Position(2) actor.Yaw];
+end
+
+% ===================================================================
+% Update car position based on dynamics
+% ===================================================================
+function actor = updateActor(actor,xdot,dt)
+    pos = actor.Position;
+    yaw = actor.Yaw;
+    actor.Position = [pos(1)+xdot(1)*dt pos(2)+xdot(2)*dt 0];
+    actor.Velocity = [xdot(1) xdot(2) 0];
+    actor.Yaw = wrapTo180(yaw + rad2deg(xdot(3)*dt));
+end
+
+function dps = rps2dps(rps)
+    dps = rps * (360/(2*pi));
+end
+% ===================================================================
+% Bicycle Dynamics model for the car
+% ===================================================================
+% function xdot = dynamics(state,u)
+%     kinematicModel = bicycleKinematics;
+%     statedot = derivative(kinematicModel,state,[u(1) u(2)]);
+%     xposdot = statedot(1);
+%     ydot = statedot(2);
+%     thetadot = statedot(3);
+%     xdot = [xposdot;ydot;thetadot];
+% end
+function xdot = dynamics(x0, a)
+    global vehicleLength
+    L = vehicleLength;
+    v = a(1); % desired velocity
+    delta = a(2); % steering angle
+    beta = atan((1/2) * tan(delta)); % sideslip angle
+    phi = atan((L/(L + (1/2)*tan(delta)*L))*tan(delta));
+    xdot = [v*cos(deg2rad(x0(3))+beta); v*sin(deg2rad(x0(3))+beta);
+            (v/L)*sin(beta)*cos(beta-deg2rad(x0(3)))+(v/L)*tan(deg2rad(x0(3)))*cos(beta)];
+%     x1 = x0 + xdot*dt
+%     x1(3) = wrapToPi(x1(3)); % wrap yaw angle to [-pi, pi]
+end
+
+% ===================================================================
+% Check car for collisions with enviornment
+% ===================================================================
+function obstacles = getObstacles(scenario)
+    global actorID;
+    allActorPoses = actorPoses(scenario);
+    obstacles = zeros(length(allActorPoses)-1,3);
+    count = 1;
+    for i=1:length(allActorPoses)
+        if(allActorPoses(i).ActorID ~= actorID)
+            obstacles(count,:) = allActorPoses(i).Position;
+            count = count + 1;
+        end
+    end
+end
+% ===================================================================
+% Finds the closest obstacle given the current state and all the obstacles
+% in current scenario
+% ===================================================================
+function [closestObstacle,closest_dist] = findClosestObstacle(state, obstacleSet)
+    % Get the number of points in the set
+    num_points = size(obstacleSet, 1);
+    
+    % Initialize the closest point and distance
+    closestObstacle = obstacleSet(1,:);
+    closest_dist = norm(state - closestObstacle);
+    
+    % Iterate through the rest of the points in the set
+    for i = 2:num_points
+        % Calculate the distance to the current point
+        dist = norm(state - obstacleSet(i,:));
+        
+        % If the distance is less than the closest distance, update the
+        % closest point and distance
+        if dist < closest_dist
+            closestObstacle = obstacleSet(i,:);
+            closest_dist = dist;
+        end
+    end
+end
+% ===================================================================
+% Train the main network
+% ===================================================================
+function Qm = train(x0k,a0k,x1k,Qt,gamma,alpha,xd,Qm,r0k)
+    inds=randi(length(a0k),500,1);
+    xs = x0k(:,inds);
+    as = a0k(:,inds);
+    x1s = x1k(:,inds);
+    rs = r0k(:,inds);
+    Qj= td_update(xs,as,x1s,Qt,gamma,alpha,xd,rs); %temporal difference update function
+    Qm= learn_q_factor(xs,Qj,Qm);
+end
+
+% ===================================================================
+% Update the Q-function using the temporal difference error
+% ===================================================================
+function Qxnew = td_update(x0,a_ind,x1,Qt,gamma,alpha,xd,r0)
+    Qx = predict(Qt.trainedNet,x0');
+    Qx1 = predict(Qt.trainedNet,x1');
+    Qhat0 = get_q_factor(a_ind,Qx);
+    Qhat1 = get_Qstar(Qx1);
+    Qnew = Qhat0 + alpha*(cost_function(x0,Qt.a(a_ind),xd,r0)'+ gamma*Qhat1-Qhat0);
+    Qxnew = set_q_factor(a_ind,Qnew,Qx);
+end
+
+function Q= learn_q_factor(xs,Qnew,Q)
+    [trainedNet, info] = trainNetwork(xs', Qnew, Q.layers, Q.opts);
+    Q.trainedNet = trainedNet;
+    Q.layers = trainedNet.Layers;
+end
+
+% ===================================================================
+% compute the cost-to-go from the q-factor
+% ===================================================================
+function J = cost_to_go(Q,s)
+    Qx = predict(Q.trainedNet,s');
+    [J, ind]= min(Qx,[],2);
+end
+
+% ===================================================================
+% This function defines the instantaneous cost (i.e. g(x,u))
+% Note that X and u are vectors
+% ===================================================================
+function C = cost_function(X,u,Xd,reward)
+    global dt;
+    [Q,R]=get_QR;
+    state_cost=(Q(1,1)*(X(1,:)-Xd(1)).^2 + Q(2,2)*(X(2,:)-Xd(2)).^2 ...
+        + Q(3,3)*(angle_diff(X(3,:), Xd(3))).^2) + R*u.^2;
+
+    dist = norm(X(1:2,:) - Xd(1:2)');
+
+    C = state_cost + reward;
+end
+
+function [Q,R] = get_QR
+    global dt;
+    Q = diag([10 10 1]).*dt;
+    R = [0.1 1]*dt;
+end
+
+function d = angle_diff(a1, a2)
+    d = mod(a1-a2+180, 360) - 180;
+end
+% ===================================================================
+% Compute the reward for current state
+% ===================================================================
+function [r, isOffRoad] = getReward(state,scenario,goal)
+    r = 0;
+    isOffRoad = false;
+    obstacles = getObstacles(scenario);
+    boundaries = obstacles(1:end,:);
+    boundariesPos = boundaries(:,1:2);
+    % Make Polygon form road boundaries to see if car si still on road
+    [in,on] = inpolygon(state(1),state(2),boundariesPos(:,1),boundariesPos(:,2));
+    xq = state(1);
+    yq = state(2);
+    offRoadPenalty = 0; % Reward actor for staying on road
+    if (numel(xq(in))==0 || numel(yq(in))==0)
+        offRoadPenalty = 1; % Penalty for going off road
+        isOffRoad = true;
+    end
+    pos = [state(1) state(2) 0];
+    [obstacleCenter,distObstacle] = findClosestObstacle(pos,obstacles);
+
+    if distObstacle < 0.5
+        distPenalty = 2;
+    else
+        distPenalty = 1/distObstacle;
+    end
+
+    goalDist = norm([state(1) state(2)]-[goal(1) goal(2)]);
+    if goalDist < 1
+        goalReward = -1;
+    else
+        goalReward = 0; % Living Cost
+    end
+    r = offRoadPenalty + distPenalty + goalReward;
+    r = distPenalty;
+end
+
+% ===================================================================
+% Compute the policy given from a particular state using the optimal
+% q-factor
+% ===================================================================
+function ind =get_action(Q,x,epsilon)
+    p = rand(1);
+    if p<epsilon
+            ind=randi(length(Q.a));
+    else
+        Q0 = predict(Q.trainedNet,x');
+        [val, ind]= min(Q0);    
+    end
+end
+
+% ===================================================================
+% Compute the optimal q-factor
+% ===================================================================
+function Qstar= get_Qstar(Qx)
+    [Qstar, ind]= min(Qx,[],2);
+end
+
+% ===================================================================
+% Get the Q-factor for state x and action a
+% ===================================================================
+function Q0= get_q_factor(as,Qx)  
+    [m,n] = size(Qx);
+    I = 1:1:m;
+    a = as(1,:);
+    inds= sub2ind(size(Qx),I,a);
+    Q0(:,1)=Qx(inds);
+end
+
+% ===================================================================
+% Set the q-factor for state x and action a
+% ===================================================================
+function Qx= set_q_factor(as,Q0,Qx)
+    [m,n] = size(Qx);
+    I = 1:1:m;
+    a = as(1,:);
+    inds= sub2ind(size(Qx),I,a);
+    Qx(inds) = Q0(:,1);
+end
+
+% ===============================================================
+% This function plots the value function and policy
+%================================================================
+function vi_plot(J,xk,y_bins,x_bins,fh)
+    set(0, 'CurrentFigure', fh);
+    clf reset;
+    n1 = size(y_bins,2); n2 = size(x_bins,2);
+    imagesc(y_bins,x_bins,reshape(J,n1,n2)'); axis xy;
+    %plot(xk(1,:),xk(2,:),'*k')
+    %hold off
+    drawnow; 
+end
